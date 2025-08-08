@@ -2,18 +2,13 @@ name: Continuous Persistent VPS with Pterodactyl
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */6 * * *'
   workflow_dispatch:
-    inputs:
-      VPS_IP:
-        description: 'Enter the VPS IP (from Tailscale)'
-        required: true
-        default: '127.0.0.1'
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # Just under 6 hours
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repo
@@ -32,17 +27,25 @@ jobs:
       - name: Install prerequisites
         run: |
           sudo apt update
-          sudo apt install -y tmate curl unzip sudo net-tools neofetch
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch software-properties-common lsb-release ca-certificates apt-transport-https gnupg
 
-      - name: Install Tailscale official script
+      - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
+      - name: Restore backup files
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /
+          else
+            echo "No backup found, starting fresh"
+          fi
+
       - name: Restore Tailscale state
         run: |
-          if [ -f ./backup/tailscaled.state ]; then
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
             sudo mkdir -p /var/lib/tailscale
-            sudo cp ./backup/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
             sudo chmod 600 /var/lib/tailscale/tailscaled.state
           fi
 
@@ -51,6 +54,8 @@ jobs:
           sudo tailscaled &
           sleep 8
           sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo || echo "Tailscale already up"
+          echo "Tailscale IPv4:"
+          tailscale ip -4 || echo "Not found"
 
       - name: Create user biralo with sudo
         run: |
@@ -61,52 +66,69 @@ jobs:
             echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
           fi
 
-      - name: Set VPS IP from input
+      - name: Install PHP 8.3 and dependencies
         run: |
-          echo "VPS_IP=${{ github.event.inputs.VPS_IP }}" >> $GITHUB_ENV
-          echo "Using IP: ${{ github.event.inputs.VPS_IP }}"
-
-      - name: Install prerequisites for Pterodactyl (PHP 8.3)
-        run: |
-          sudo apt update
-          sudo apt install -y software-properties-common curl unzip sudo net-tools neofetch
           sudo add-apt-repository ppa:ondrej/php -y
           sudo apt update
-          sudo apt install -y \
-            php8.3 php8.3-cli php8.3-gd php8.3-mysql php8.3-mbstring \
-            php8.3-bcmath php8.3-xml php8.3-curl php8.3-zip php8.3-fpm \
-            mariadb-server mariadb-client redis-server \
-            nginx git zip unzip tar composer docker.io
-          sudo systemctl enable --now mariadb redis-server docker nginx php8.3-fpm
-          php -v
+          sudo apt install -y php8.3 php8.3-cli php8.3-gd php8.3-mysql php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-curl \
+            mariadb-server mariadb-client redis-server unzip tar curl nginx composer docker.io docker-compose
+
+      - name: Configure MySQL
+        run: |
+          sudo service mysql start
+          sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'biralo'; FLUSH PRIVILEGES;"
 
       - name: Install Pterodactyl Panel
         run: |
-          sudo mkdir -p /var/www/pterodactyl
-          cd /var/www/pterodactyl
+          cd /var/www
+          sudo mkdir -p pterodactyl
+          sudo chown -R $USER:$USER pterodactyl
+          cd pterodactyl
           curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
           tar -xzvf panel.tar.gz
+          cp .env.example .env
           composer install --no-dev --optimize-autoloader
           php artisan key:generate --force
           php artisan p:environment:setup \
-            --author="Admin" \
-            --url="http://${VPS_IP}" \
+            --url="http://$(tailscale ip -4 | head -n1)" \
             --timezone="UTC" \
             --cache="redis" \
             --session="redis" \
             --queue="redis" \
-            --mysql-host="127.0.0.1" \
-            --mysql-port="3306" \
-            --mysql-database="panel" \
-            --mysql-username="pterodactyl" \
-            --mysql-password="password" \
-            --redis-host="127.0.0.1" \
-            --redis-password="null" \
-            --redis-port="6379" \
-            --settings-ui=true \
-            --telemetry=true
+            --driver="mysql" \
+            --host="127.0.0.1" \
+            --port="3306" \
+            --database="panel" \
+            --username="root" \
+            --password="biralo" \
+            --email="admin@example.com"
+          sudo mysql -uroot -pbiralo -e "CREATE DATABASE panel;"
+          php artisan migrate --seed --force
           sudo chown -R www-data:www-data /var/www/pterodactyl
-          sudo chmod -R 755 /var/www/pterodactyl
+          sudo systemctl enable redis-server
+          sudo systemctl restart redis-server
+          sudo tee /etc/nginx/sites-available/pterodactyl <<EOF
+server {
+    listen 80;
+    server_name _;
+
+    root /var/www/pterodactyl/public;
+    index index.php;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+}
+EOF
+          sudo ln -sf /etc/nginx/sites-available/pterodactyl /etc/nginx/sites-enabled/
+          sudo systemctl restart nginx
 
       - name: Create Pterodactyl admin user
         run: |
@@ -119,25 +141,45 @@ jobs:
             --password="BlackHero" \
             --admin=1
 
-      - name: Install Pterodactyl Wings
+      - name: Install Wings
         run: |
-          sudo mkdir -p /etc/pterodactyl
           curl -Lo wings https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64
+          chmod +x wings
           sudo mv wings /usr/local/bin/wings
-          sudo chmod +x /usr/local/bin/wings
-          echo "Wings installed. Run manually: wings --config /etc/pterodactyl/config.yml"
+          sudo mkdir -p /etc/pterodactyl
+          sudo tee /etc/systemd/system/wings.service <<EOF
+[Unit]
+Description=Pterodactyl Wings
+After=docker.service
+Requires=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable wings
 
       - name: Start tmate session for SSH access
         uses: mxschmitt/action-tmate@v3
 
       - name: Sleep to keep VPS alive
-        run: sleep 21600  # 6 hours
+        run: sleep 21600
 
-      - name: Backup VPS data and tailscale state
+      - name: Backup VPS data
         run: |
-          sudo mkdir -p backup
-          sudo cp /var/lib/tailscale/tailscaled.state backup/
-          zip -r backup.zip backup
+          sudo mkdir -p /opt/vps-backup/data
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
 
       - name: Upload VPS backup artifact
         uses: actions/upload-artifact@v4
